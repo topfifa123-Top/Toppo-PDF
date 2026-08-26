@@ -265,6 +265,7 @@ input,select,textarea{font:inherit}
 .zbtn:hover{background:var(--rail-2)}
 .zbtn.zlabel{width:48px;font-size:11px;font-family:var(--mono);color:var(--on-dark-dim);border-left:1px solid var(--hair);border-right:1px solid var(--hair)}
 .ed-layer{position:absolute;inset:0}
+#edHot, #edOv{position:absolute;inset:0}
 .ov{
   position:absolute;cursor:move;border:1px dashed transparent;
   transition:border-color .1s;touch-action:none;
@@ -466,7 +467,7 @@ input,select,textarea{font:inherit}
     </header>
     <div class="ed">
       <div class="ed-stage" id="edStage">
-        <div class="ed-page" id="edPage"><canvas id="edCanvas"></canvas><div class="ed-layer" id="edLayer"></div></div>
+        <div class="ed-page" id="edPage"><canvas id="edCanvas"></canvas><div class="ed-layer" id="edLayer"><div id="edHot"></div><div id="edOv"></div></div></div>
       </div>
       <aside class="ed-side">
         <h4>ข้อความจากภาพ (OCR)</h4>
@@ -1760,9 +1761,12 @@ const PALETTE = ['#E02020','#E0007A','#F5A300','#12A150','#0B72D9','#151A21','#F
 const DRAW = { tool:null, stroke:'#E02020', fill:null, th:2 };
 const SHAPES = new Set(['rect','ellipse','line','arrow','ink','highlight']);
 
-/* ── วาด overlay ทั้งหมดลงหน้ากระดาษในตัวแก้ไข ── */
-function drawOverlays(){
-  const p = ED.page, layer = $('#edLayer');
+/* ── วาด overlay ทั้งหมดลงหน้ากระดาษในตัวแก้ไข ──
+   แยกเป็นสองชั้นถาวร: #edHot (จุดคลิกแก้ข้อความเดิม) กับ #edOv (สี่เหลี่ยม/วงกลม/ข้อความที่วางไว้)
+   ระหว่างลากของหรือพิมพ์แก้ข้อความ เรียก renderOvLayer() เฉพาะจุด ไม่แตะแผงด้านขวาและไม่แตะชั้นจุดคลิก
+   กันอาการพิมพ์ได้ทีละตัว/ลากแล้วกระตุก ซึ่งเกิดจากการ rebuild ทั้งแผงทุกครั้งที่ขยับนิดเดียว */
+function renderOvLayer(){
+  const p = ED.page, layer = $('#edOv');
   const { vw, vh } = viewSize(p);
   const pw = $('#edPage').clientWidth, ph = $('#edPage').clientHeight;
   layer.innerHTML = '';
@@ -1774,7 +1778,11 @@ function drawOverlays(){
   const k = pw / vw;                       // จุด PDF -> พิกเซลบนจอ
 
   p.overlays.forEach((o, i) => {
-    if (SHAPES.has(o.type)) svg.appendChild(shapeNode(o, pw, ph, k));
+    if (SHAPES.has(o.type)){
+      const g = shapeNode(o, pw, ph, k);
+      g.dataset.i = i;
+      svg.appendChild(g);
+    }
 
     const d = document.createElement('div');
     d.className = 'ov' + (ED.sel === i ? ' on' : '') + (SHAPES.has(o.type) ? ' shape' : '');
@@ -1809,8 +1817,23 @@ function drawOverlays(){
     }
     layer.appendChild(d);
   });
+}
+function drawOverlays(){
+  renderOvLayer();
   inspect();
   if (DRAW.tool === 'edittext') showHotspots();
+}
+
+/* แก้เฉพาะรูปทรงเดียวระหว่างลาก/รีไซส์ โดยไม่แตะ DOM ของ .ov div ที่กำลังจับ pointer capture อยู่
+   (เดิมของานี้เรียก renderOvLayer() ทุก pointermove ซึ่งลบ-สร้างตัว div ที่ถูกจับ pointer อยู่ใหม่ทุกเฟรม
+   ทำให้ pointer capture หลุดกลางอากาศ — คืออาการ "ลากแล้วติดๆ ขัดๆ" ที่แท้จริง) */
+function patchShapeLive(i, o){
+  const svg = document.querySelector('#edOv svg.shapes'); if (!svg) return;
+  const old = svg.querySelector('g[data-i="' + i + '"]');
+  const pw = $('#edPage').clientWidth, ph = $('#edPage').clientHeight, k = pw / viewSize(ED.page).vw;
+  const fresh = shapeNode(o, pw, ph, k);
+  fresh.dataset.i = i;
+  if (old) old.replaceWith(fresh); else svg.appendChild(fresh);
 }
 
 /* จุดปลายเส้น/ลูกศร: เก็บเป็นกล่องครอบ + ทิศทางแนวทแยง */
@@ -2004,8 +2027,8 @@ function sampleBg(p, line){
 
 /* วางกรอบคลิกทับข้อความเดิมทุกบรรทัด */
 async function showHotspots(){
-  const layer = $('#edLayer'), p = ED.page;
-  layer.querySelectorAll('.hot').forEach(h => h.remove());
+  const layer = $('#edHot'), p = ED.page;
+  layer.innerHTML = '';
   if (DRAW.tool !== 'edittext') return;
   const lines = await allLines(p);
   if (!lines.length){
@@ -2057,7 +2080,7 @@ $('#edTools').addEventListener('click', e => {
   if (DRAW.tool === 'highlight'){ DRAW.fill = '#F5E100'; DRAW.stroke = null; }
   syncTools();
   if (DRAW.tool === 'edittext') showHotspots();
-  else $$('#edLayer .hot').forEach(h => h.remove());
+  else $('#edHot').innerHTML = '';
 });
 function syncTools(){
   $$('#edTools .tbtn').forEach(b => b.classList.toggle('on', b.dataset.tool === DRAW.tool));
@@ -2083,13 +2106,13 @@ function applyToSelection(key){
   const o = ED.page?.overlays[ED.sel];
   if (!o || !SHAPES.has(o.type)) return;
   o[key] = DRAW[key];
-  drawOverlays();
+  renderOvLayer();
 }
 $('#thickness').oninput = e => {
   DRAW.th = +e.target.value;
   $('#thV').textContent = DRAW.th;
   const o = ED.page?.overlays[ED.sel];
-  if (o && SHAPES.has(o.type)){ o.th = DRAW.th; drawOverlays(); }
+  if (o && SHAPES.has(o.type)){ o.th = DRAW.th; renderOvLayer(); }
 };
 
 /* ── วาดรูปทรงบนหน้ากระดาษ ── */
@@ -2133,7 +2156,7 @@ $('#edLayer').addEventListener('pointerdown', e => {
       o.fx = Math.min(x0, x0 + dx)/pw; o.fy = Math.min(y0, y0 + dy)/ph;
       o.fw = Math.abs(dx)/pw;         o.fh = Math.abs(dy)/ph;
     }
-    drawOverlays();
+    renderOvLayer();       // ระหว่างลากวาด อัปเดตแค่ชั้นรูปทรง ไม่แตะแผงขวา/จุดคลิก กันกระตุก
   };
   const up = () => {
     layer.removeEventListener('pointermove', move);
@@ -2141,13 +2164,18 @@ $('#edLayer').addEventListener('pointerdown', e => {
     if (o.type === 'ink'){ delete o.raw; if (!o.pts || o.pts.length < 2) ED.page.overlays.pop(); }
     else if (o.fw < 0.008 && o.fh < 0.008) ED.page.overlays.pop();
     ED.sel = Math.min(ED.sel, ED.page.overlays.length - 1);
-    drawOverlays();
+    drawOverlays();        // จบการลากแล้วค่อย sync แผงขวาให้ตรงกับรูปทรงที่เพิ่งวาดเสร็จ
   };
   layer.addEventListener('pointermove', move);
   layer.addEventListener('pointerup', up);
 });
 
-/* ── ลาก / ย่อขยายของที่วางไว้แล้ว ── */
+/* ── ลาก / ย่อขยายของที่วางไว้แล้ว ──
+   สำคัญ: ห้ามเรียก renderOvLayer()/drawOverlays() ระหว่างลาก เพราะมันจะลบ-สร้าง DOM element
+   ที่กำลังถือ pointer capture อยู่ใหม่ทุกเฟรม พอ element เดิมหลุดจาก DOM ตัว capture ก็หลุดตาม
+   เบราว์เซอร์จะปล่อย pointer กลับไปที่ hit-test ปกติกลางอากาศ — นี่คืออาการ "ลากแล้วติดๆ ขัดๆ" ตัวจริง
+   ทางแก้: ระหว่างลากให้ขยับ/ย่อ-ขยาย DOM element ตัวเดิมตรงๆ ด้วย style เท่านั้น
+   ถ้าเป็นรูปทรง (สี่เหลี่ยม/วงกลม ฯลฯ) ให้แพตช์แค่โหนด SVG ของรูปนั้นแยกต่างหาก (ไม่แตะตัว .ov ที่ลากอยู่) */
 $('#edLayer').addEventListener('pointerdown', e => {
   if (DRAW.tool && DRAW.tool !== 'edittext') return;
   const el = e.target.closest('.ov'); if (!el) return;
@@ -2157,8 +2185,8 @@ $('#edLayer').addEventListener('pointerdown', e => {
     DRAW.stroke = o.stroke; DRAW.fill = o.fill; DRAW.th = o.th || 2;
     $('#thickness').value = DRAW.th; $('#thV').textContent = DRAW.th;
   }
-  drawOverlays();
-  const live = $('#edLayer').querySelector('[data-i="' + i + '"]');
+  drawOverlays();   // ครั้งเดียวตอนเริ่มลาก — sync แผงขวาให้ตรงกับของที่เพิ่งเลือก
+  const live = $('#edOv').querySelector('[data-i="' + i + '"]');
   const pw = $('#edPage').clientWidth, ph = $('#edPage').clientHeight;
   const grip = e.target.classList.contains('grip');
   const sx = e.clientX, sy = e.clientY, o0 = { ...o };
@@ -2174,15 +2202,20 @@ $('#edLayer').addEventListener('pointerdown', e => {
         o.fw = Math.max(0.008, o0.fw + dx);
         o.fh = Math.max(0.008, o0.fh + dy);
       }
+      live.style.width  = (o.fw * pw) + 'px';
+      live.style.height = (o.fh * ph) + 'px';
     } else {
       o.fx = Math.min(1, Math.max(-0.2, o0.fx + dx));
       o.fy = Math.min(1, Math.max(-0.2, o0.fy + dy));
+      live.style.left = (o.fx * pw) + 'px';
+      live.style.top  = (o.fy * ph) + 'px';
     }
-    drawOverlays();
+    if (SHAPES.has(o.type)) patchShapeLive(i, o);   // แพตช์เฉพาะรูป SVG ของชิ้นนี้ ไม่แตะ live เอง
   };
   const up = () => {
     live.removeEventListener('pointermove', move);
     live.removeEventListener('pointerup', up);
+    drawOverlays();         // จบการลากแล้ว sync ตัวเลขในแผงขวา (เช่น % ความกว้าง) ให้ตรงค่าล่าสุด
   };
   live.addEventListener('pointermove', move);
   live.addEventListener('pointerup', up);
@@ -2231,26 +2264,29 @@ function inspect(){
   box.innerHTML = html;
 
   const q = id => box.querySelector(id);
-  q('#ovText')  && (q('#ovText').oninput  = e => { o.text = e.target.value; drawOverlays(); });
-  q('#ovSize')  && (q('#ovSize').oninput  = e => { o.size = +e.target.value || 12; drawOverlays(); });
-  q('#ovFont')  && (q('#ovFont').onchange = e => { o.font = e.target.value; drawOverlays(); });
-  q('#ovColor') && (q('#ovColor').oninput = e => { o.color = e.target.value; drawOverlays(); });
-  q('#ovBg')    && (q('#ovBg').oninput    = e => { o.bg = e.target.value; q('#ovNoBg').checked = false; drawOverlays(); });
-  q('#ovNoBg')  && (q('#ovNoBg').onchange = e => { o.bg = e.target.checked ? 'none' : (q('#ovBg').value || '#ffffff'); drawOverlays(); });
+  // ทุกช่องด้านล่างนี้ตั้งใจใช้ renderOvLayer() ไม่ใช่ drawOverlays() — เพราะ drawOverlays() จะ
+  // rebuild แผงนี้ทั้งกล่อง ซึ่งทำลาย textarea/input ที่ผู้ใช้กำลังโฟกัสอยู่ทุกครั้งที่กดแป้นพิมพ์
+  // (คืออาการ "พิมพ์ได้ทีละตัวอักษร ต้องคลิกใหม่ทุกครั้ง" ที่เจอ) เปลี่ยนแค่ตัวไหน สั่งวาดใหม่แค่ตัวนั้นพอ
+  q('#ovText')  && (q('#ovText').oninput  = e => { o.text = e.target.value; renderOvLayer(); });
+  q('#ovSize')  && (q('#ovSize').oninput  = e => { o.size = +e.target.value || 12; renderOvLayer(); });
+  q('#ovFont')  && (q('#ovFont').onchange = e => { o.font = e.target.value; renderOvLayer(); });
+  q('#ovColor') && (q('#ovColor').oninput = e => { o.color = e.target.value; renderOvLayer(); });
+  q('#ovBg')    && (q('#ovBg').oninput    = e => { o.bg = e.target.value; q('#ovNoBg').checked = false; renderOvLayer(); });
+  q('#ovNoBg')  && (q('#ovNoBg').onchange = e => { o.bg = e.target.checked ? 'none' : (q('#ovBg').value || '#ffffff'); renderOvLayer(); });
   q('#ovSpin')  && (q('#ovSpin').oninput  = e => {
     const v = +e.target.value || 0;
     if (o.type === 'edit') o.ang = v; else o.spin = v;
-    drawOverlays();
+    renderOvLayer();
   });
-  q('#ovFlip')  && (q('#ovFlip').onclick  = () => { o.d1 = !o.d1; drawOverlays(); });
+  q('#ovFlip')  && (q('#ovFlip').onclick  = () => { o.d1 = !o.d1; renderOvLayer(); });
   q('#ovW')     && (q('#ovW').oninput     = e => {
     const nw = Math.max(0.02, (+e.target.value || 20)/100);
-    o.fh = o.fh * (nw / o.fw); o.fw = nw; drawOverlays();
+    o.fh = o.fh * (nw / o.fw); o.fw = nw; renderOvLayer();
   });
   q('#ovOp').oninput = e => {
     o.opacity = +e.target.value/100;
     q('#ovOpV').textContent = e.target.value + '%';
-    drawOverlays();
+    renderOvLayer();
   };
   q('#ovDel').onclick = () => { ED.page.overlays.splice(i,1); ED.sel = null; drawOverlays(); };
 }
