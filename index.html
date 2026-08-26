@@ -14,6 +14,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@pdf-lib/fontkit@1.1.1/dist/fontkit.umd.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.0.5/dist/tesseract.min.js"></script>
 <style>
 :root{
   --ink:#151A21;
@@ -258,7 +259,11 @@ input,select,textarea{font:inherit}
   justify-content:center;overflow:auto;padding:24px;min-width:0;
 }
 .ed-page{position:relative;background:#fff;box-shadow:0 6px 30px rgba(0,0,0,.35);flex:0 0 auto}
-.ed-page canvas{display:block}
+.ed-page canvas{display:block;width:100%;height:100%}
+.zoombar{display:flex;align-items:center;gap:2px;border:1px solid var(--rail-3);border-radius:5px;overflow:hidden;flex:0 0 auto}
+.zbtn{width:30px;height:28px;color:var(--on-dark);font-size:15px;display:flex;align-items:center;justify-content:center}
+.zbtn:hover{background:var(--rail-2)}
+.zbtn.zlabel{width:48px;font-size:11px;font-family:var(--mono);color:var(--on-dark-dim);border-left:1px solid var(--hair);border-right:1px solid var(--hair)}
 .ed-layer{position:absolute;inset:0}
 .ov{
   position:absolute;cursor:move;border:1px dashed transparent;
@@ -452,11 +457,32 @@ input,select,textarea{font:inherit}
   <div class="panel wide">
     <header>
       <h2 id="edTitle">แก้ไขหน้า</h2>
+      <div class="zoombar">
+        <button class="zbtn" id="zoomOut" title="ซูมออก">−</button>
+        <button class="zbtn zlabel" id="zoomReset" title="กลับไปพอดีหน้าจอ">100%</button>
+        <button class="zbtn" id="zoomIn" title="ซูมเข้า">+</button>
+      </div>
       <button class="x" id="edClose" aria-label="ปิด">&times;</button>
     </header>
     <div class="ed">
-      <div class="ed-stage"><div class="ed-page" id="edPage"><canvas id="edCanvas"></canvas><div class="ed-layer" id="edLayer"></div></div></div>
+      <div class="ed-stage" id="edStage">
+        <div class="ed-page" id="edPage"><canvas id="edCanvas"></canvas><div class="ed-layer" id="edLayer"></div></div>
+      </div>
       <aside class="ed-side">
+        <h4>ข้อความจากภาพ (OCR)</h4>
+        <div class="row2" style="margin-bottom:8px">
+          <select id="ocrLang">
+            <option value="tha+eng">ไทย + อังกฤษ</option>
+            <option value="eng">อังกฤษ</option>
+            <option value="tha">ไทยล้วน</option>
+            <option value="chi_sim">จีนตัวย่อ</option>
+            <option value="chi_tra">จีนตัวเต็ม</option>
+            <option value="jpn">ญี่ปุ่น</option>
+            <option value="kor">เกาหลี</option>
+          </select>
+          <button class="btn" id="ocrRun">สแกนหน้านี้</button>
+        </div>
+        <p class="hint" id="ocrStatus" style="margin-top:-2px">ใช้ตอนหน้านี้เป็นภาพสแกน กดเครื่องมือ "แก้ข้อความ" แล้วคลิกไม่ติดสักตัว — สแกนเสร็จแล้วจะแก้ทีละบรรทัดได้เหมือนข้อความจริง</p>
         <h4>เครื่องมือวาด</h4>
         <div class="tool-row" id="edTools">
           <button class="tbtn" data-tool="rect" title="สี่เหลี่ยม"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="4" y="6" width="16" height="12" rx="1"/></svg></button>
@@ -1499,7 +1525,7 @@ $('#tFind').onclick = () => {
     for (let k = 0; k < S.pages.length; k++){
       const pg = S.pages[k];
       if (pg.blank) continue;
-      const lines = await textLines(pg);
+      const lines = await allLines(pg);
       if (my !== seq) return;
       for (const L of lines){
         const idx = L.str.toLowerCase().indexOf(ql);
@@ -1625,34 +1651,45 @@ $('#tSign').onclick = () => {
 let sigHasStrokes = false;
 
 
-/* ══ ตัวแก้ไขหน้า ═══════════════════════════ */
-let ED = { page:null, scale:1, sel:null };
+/* ══ ตัวแก้ไขหน้า ═══════════════════════════
+   ระบบซูม: canvas เรนเดอร์ที่ความละเอียดสูงกว่าที่แสดงจริง (RENDER_BOOST เท่า) ครั้งเดียวตอนเปิด
+   ส่วนขนาดที่ "แสดง" (#edPage layout width/height) ปรับตาม ED.zoom ล้วนๆ ผ่าน CSS width:100% บน canvas
+   จึงซูมเข้าได้ระดับหนึ่งโดยไม่แตก และ overlay ทุกจุดคำนวณจาก clientWidth/Height ของ #edPage สดใหม่เสมอ
+   ══════════════════════════════════════════ */
+const RENDER_BOOST = 2.2;         // เรนเดอร์ล่วงหน้าไว้กี่เท่าของขนาดที่พอดีจอ
+const RENDER_CAP = 2600;          // จำกัดพิกเซลด้านยาวสุด กันเครื่องแรงไม่พอ/มือถือหน่วยความจำระเบิด
+let ED = { page:null, scale:1, sel:null, zoom:1, fitW:0, fitH:0 };
 
 async function openEditor(id){
   const p = S.pages.find(x => x.id === id); if (!p) return;
-  ED.page = p; ED.sel = null;
+  ED.page = p; ED.sel = null; ED.zoom = 1;
   const { vw, vh } = viewSize(p);
   const narrow = window.innerWidth < 820;
   const maxW = narrow ? window.innerWidth - 72 : Math.min(660, window.innerWidth - 360);
   const maxH = window.innerHeight * (narrow ? 0.42 : 0.6);
-  ED.scale = Math.min(maxW / vw, maxH / vh);
+  ED.scale = Math.min(maxW / vw, maxH / vh);            // scale ของขนาด "พอดีจอ" (zoom 100%)
+  ED.fitW = Math.round(vw * ED.scale);
+  ED.fitH = Math.round(vh * ED.scale);
+
+  const boost = Math.min(RENDER_BOOST, RENDER_CAP / Math.max(ED.fitW, ED.fitH, 1));
+  const renderScale = ED.scale * Math.max(1, boost);
 
   const c = $('#edCanvas');
-  c.width = Math.round(vw * ED.scale);
-  c.height = Math.round(vh * ED.scale);
-  $('#edPage').style.width = c.width + 'px';
-  $('#edPage').style.height = c.height + 'px';
+  c.width = Math.round(vw * renderScale);
+  c.height = Math.round(vh * renderScale);
   const ctx = c.getContext('2d');
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
 
   if (!p.blank){
     const src = await S.sources[p.src].doc.getPage(p.idx + 1);
-    const vp = src.getViewport({ scale: ED.scale, rotation: (src.rotate + p.rot) % 360 });
+    const vp = src.getViewport({ scale: renderScale, rotation: (src.rotate + p.rot) % 360 });
     c.width = Math.ceil(vp.width); c.height = Math.ceil(vp.height);
-    $('#edPage').style.width = c.width + 'px';
-    $('#edPage').style.height = c.height + 'px';
     await src.render({ canvasContext:c.getContext('2d'), viewport:vp }).promise;
   }
+  applyZoom();   // ตั้ง #edPage layout width/height ตาม ED.zoom (canvas จะยืด/หดตามด้วย CSS)
+  $('#ocrStatus').textContent = OCR_CACHE.has(p.id + ':' + totalRot(p))
+    ? 'หน้านี้เคยสแกนไว้แล้ว — กดเครื่องมือ "แก้ข้อความ" แล้วคลิกบรรทัดที่ต้องการแก้ได้เลย'
+    : 'ใช้ตอนหน้านี้เป็นภาพสแกน กดเครื่องมือ "แก้ข้อความ" แล้วคลิกไม่ติดสักตัว — สแกนเสร็จแล้วจะแก้ทีละบรรทัดได้เหมือนข้อความจริง';
 
   $('#edTitle').textContent = 'แก้ไขหน้า ' + (S.pages.indexOf(p) + 1) + ' — ' + paperName(vw, vh);
   DRAW.tool = null;
@@ -1660,11 +1697,64 @@ async function openEditor(id){
   drawOverlays();
   $('#edScrim').classList.add('on');
 }
+$('#ocrRun').onclick = async () => {
+  if (!ED.page) return;
+  const btn = $('#ocrRun'), status = $('#ocrStatus'), lang = $('#ocrLang').value;
+  btn.disabled = true; $('#ocrLang').disabled = true;
+  try {
+    const lines = await runOCR(ED.page, lang);
+    if (!lines.length){
+      status.textContent = 'ไม่พบข้อความในหน้านี้ — ลองเปลี่ยนภาษาในดรอปดาวน์แล้วสแกนใหม่ดูอีกที';
+    } else {
+      status.textContent = 'พบ ' + lines.length + ' บรรทัด — คลิกบรรทัดที่ต้องการแก้บนหน้ากระดาษได้เลย';
+      DRAW.tool = 'edittext';
+      syncTools();
+      drawOverlays();
+    }
+  } catch(e){
+    console.error(e);
+    status.textContent = 'สแกนไม่สำเร็จ (' + (e.message || 'ไม่ทราบสาเหตุ') + ') ลองใหม่อีกครั้ง หรือเช็คว่าต่อเน็ตอยู่ (ต้องโหลดชุดภาษาครั้งแรก)';
+  } finally {
+    btn.disabled = false; $('#ocrLang').disabled = false;
+  }
+};
+
 $('#edClose').onclick = $('#edDone').onclick = () => {
   DRAW.tool = null; ED.sel = null;
   $('#edScrim').classList.remove('on'); render();
 };
 $('#edScrim').addEventListener('click', e => { if (e.target.id === 'edScrim') $('#edDone').click(); });
+
+/* ── ซูม ── */
+function applyZoom(){
+  $('#edPage').style.width  = Math.round(ED.fitW * ED.zoom) + 'px';
+  $('#edPage').style.height = Math.round(ED.fitH * ED.zoom) + 'px';
+  $('#zoomReset').textContent = Math.round(ED.zoom * 100) + '%';
+}
+function setZoom(z, anchor){
+  const stage = $('#edStage');
+  const before = anchor ? { sl:stage.scrollLeft, st:stage.scrollTop } : null;
+  const oldZoom = ED.zoom;
+  ED.zoom = Math.min(4, Math.max(0.4, z));
+  applyZoom();
+  drawOverlays();
+  if (anchor){
+    // คงจุดที่ผู้ใช้ชี้เมาส์ไว้ ไม่ให้หน้ากระเด็นตอนซูม
+    const ratio = ED.zoom / oldZoom;
+    stage.scrollLeft = (before.sl + anchor.x) * ratio - anchor.x;
+    stage.scrollTop  = (before.st + anchor.y) * ratio - anchor.y;
+  }
+}
+$('#zoomIn').onclick  = () => setZoom(ED.zoom * 1.25);
+$('#zoomOut').onclick = () => setZoom(ED.zoom / 1.25);
+$('#zoomReset').onclick = () => setZoom(1);
+$('#edStage').addEventListener('wheel', e => {
+  if (!e.ctrlKey && !e.metaKey) return;         // ปกติปล่อยให้เลื่อนหน้าจอตามปกติ
+  e.preventDefault();
+  const r = $('#edStage').getBoundingClientRect();
+  const anchor = { x: e.clientX - r.left, y: e.clientY - r.top };
+  setZoom(ED.zoom * (e.deltaY < 0 ? 1.1 : 1/1.1), anchor);
+}, { passive:false });
 
 const PALETTE = ['#E02020','#E0007A','#F5A300','#12A150','#0B72D9','#151A21','#FFFFFF'];
 const DRAW = { tool:null, stroke:'#E02020', fill:null, th:2 };
@@ -1789,6 +1879,57 @@ function shapeNode(o, pw, ph, k){
    เก็บมุมของข้อความ (ang) แยกจากมุมของหน้า เพราะหมุนหน้าแล้วข้อความต้องหมุนตาม
    ══════════════════════════════════════════ */
 const LINE_CACHE = new Map();
+const OCR_CACHE = new Map();   // key: pageId:totalRot -> lines[] (พิกัดดิบแบบเดียวกับ textLines)
+
+/* รวมข้อความจริง (ถ้ามี) + ข้อความจาก OCR (ถ้าเคยสแกนหน้านี้ไว้) เป็นชุดเดียว
+   ให้เครื่องมือแก้ข้อความและค้นหาใช้ต้นทางไหนก็ได้โดยไม่ต้องรู้ที่มา */
+async function allLines(p){
+  const real = await textLines(p);
+  const ocr = OCR_CACHE.get(p.id + ':' + totalRot(p)) || [];
+  return real.concat(ocr);
+}
+
+const OCR_STATUS_TH = {
+  'loading tesseract core':'กำลังโหลดโปรแกรม OCR', 'initializing tesseract':'กำลังเริ่มต้นเครื่องมือ',
+  'loading language traineddata':'กำลังโหลดชุดภาษา', 'initializing api':'กำลังเตรียมพร้อม',
+  'recognizing text':'กำลังอ่านตัวอักษร'
+};
+
+/* อ่านข้อความจากภาพหน้าที่เรนเดอร์ไว้แล้วใน #edCanvas (ความละเอียดสูงกว่าที่แสดงจริงอยู่แล้ว เหมาะกับ OCR)
+   แปลงกรอบที่เจอ (พิกเซลบนภาพ) กลับเป็นพิกัดดิบของ PDF แบบเดียวกับที่ textLines() ให้ไว้
+   เพื่อให้ใช้เครื่องมือ "แก้ข้อความ" ชุดเดิมกับข้อความจาก OCR ได้ทันทีโดยไม่ต้องเขียนโค้ดซ้ำ */
+async function runOCR(p, lang){
+  if (p.blank) return [];
+  const c = $('#edCanvas');
+  const { vw, vh } = viewSize(p);
+  const kx = c.width / vw, ky = c.height / vh;      // พิกเซลต่อ 1 pt ของ PDF
+  const status = $('#ocrStatus');
+  let worker;
+  try {
+    worker = await Tesseract.createWorker(lang, 1, {
+      logger: m => {
+        if (m.status && typeof m.progress === 'number')
+          status.textContent = (OCR_STATUS_TH[m.status] || m.status) + ' ' + Math.round(m.progress * 100) + '%';
+      }
+    });
+    const { data } = await worker.recognize(c);
+    const lines = [];
+    for (const ln of (data.lines || [])){
+      const txt = (ln.text || '').trim();
+      if (!txt || ln.confidence < 35) continue;
+      const bw = ln.bbox.x1 - ln.bbox.x0, bh = ln.bbox.y1 - ln.bbox.y0;
+      if (bw < 4 || bh < 4) continue;
+      // มุมซ้ายล่างของกรอบ (หน่วย pt ในพิกัดมุมมอง) — pdf.js เรนเดอร์ภาพตามทิศทางที่แสดงจริงอยู่แล้ว
+      // จึงแปลงกลับด้วย viewToPdf ตรงๆ ได้เหมือนจุดอื่นๆ ในระบบ ไม่ต้องคิดเรื่องหมุนซ้ำ
+      const raw = viewToPdf(p, ln.bbox.x0 / kx, ln.bbox.y1 / ky);
+      lines.push({ str:txt, x:raw.x, y:raw.y, ang: totalRot(p), size: (bh / ky) * 0.82, w: bw / kx });
+    }
+    OCR_CACHE.set(p.id + ':' + totalRot(p), lines);
+    return lines;
+  } finally {
+    if (worker) await worker.terminate();
+  }
+}
 
 async function textLines(p){
   if (p.blank) return [];
@@ -1866,9 +2007,9 @@ async function showHotspots(){
   const layer = $('#edLayer'), p = ED.page;
   layer.querySelectorAll('.hot').forEach(h => h.remove());
   if (DRAW.tool !== 'edittext') return;
-  const lines = await textLines(p);
+  const lines = await allLines(p);
   if (!lines.length){
-    toast('หน้านี้ไม่มีข้อความให้แก้ — น่าจะเป็นภาพสแกน', true);
+    toast('หน้านี้ไม่มีข้อความให้แก้ — ถ้าเป็นภาพสแกน ให้กด "สแกนหน้านี้" ในช่อง OCR ทางขวาก่อน', true);
     return;
   }
   const { vw, vh } = viewSize(p);
@@ -1891,7 +2032,7 @@ async function showHotspots(){
 
 $('#edLayer').addEventListener('click', async e => {
   const h = e.target.closest('.hot'); if (!h) return;
-  const lines = await textLines(ED.page);
+  const lines = await allLines(ED.page);
   const L = lines[+h.dataset.line];
   const { vw, vh } = viewSize(ED.page);
   const a = pdfToView(ED.page, L.x, L.y);
